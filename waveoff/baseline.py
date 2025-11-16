@@ -6,15 +6,15 @@ from typing import Iterable
 
 import numpy as np
 
-from .env import ACTION_CONTINUE, ACTION_WAVE_OFF
+from env import ACTION_CONTINUE, ACTION_WAVE_OFF
 
 
 @dataclass
 class BaselineThresholdPolicy:
     """Baseline rule-based policy for wave-off decisions."""
 
-    error_threshold: float = -1.0
-    closing_bias: float = 0.2
+    error_threshold: float = -7.0
+    closing_bias: float = 0.1
     rate_threshold: float = -0.6
     activation_distance: float = 120.0
 

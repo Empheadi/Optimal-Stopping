@@ -1,113 +1,172 @@
-"""Dataset generation for the wave-off optimal stopping problem."""
+"""Dataset generation for the wave-off optimal stopping problem.
+
+This module simulates episodes using a fixed behaviour policy (typically the
+handcrafted baseline) and records (s, a, r, s') tuples for offline RL.
+
+The resulting dataset is stored as a compressed .npz file with the following
+arrays:
+
+- observations:        shape (N, obs_dim)
+- actions:             shape (N,)
+- rewards:             shape (N,)
+- costs:               shape (N,)
+- next_observations:   shape (N, obs_dim)
+- dones:               shape (N,)
+- episode_ids:         shape (N,)
+
+where episode_ids[i] is an integer identifier for the episode to which the i-th
+transition belongs.
+"""
+
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 import numpy as np
+from tqdm.auto import trange
 
-from .baseline import BaselineThresholdPolicy
-from .env import ACTION_CONTINUE, ACTION_WAVE_OFF, WaveOffEnv
+from baseline import BaselineThresholdPolicy
+from env import ACTION_CONTINUE, ACTION_WAVE_OFF, WaveOffEnv
 
 
 def generate_dataset(
+    env: WaveOffEnv,
+    policy: BaselineThresholdPolicy,
     episodes: int,
-    output: Path,
-    seed: int = 0,
-    policy: BaselineThresholdPolicy | None = None,
-) -> None:
-    rng = np.random.default_rng(seed)
-    env = WaveOffEnv(seed=rng.integers(1_000_000_000))
-    policy = policy or BaselineThresholdPolicy()
+    seed: int | None = None,
+) -> Dict[str, np.ndarray]:
+    """Roll out the behaviour policy to create an offline dataset.
+
+    Parameters
+    ----------
+    env:
+        Wave-off environment instance. This function will call `reset()` before
+        each episode and will not modify `env.config`.
+    policy:
+        Behaviour policy to use for data collection (typically the handcrafted
+        baseline).
+    episodes:
+        Number of episodes to simulate.
+    seed:
+        Optional random seed to re-seed the environment RNG before generation.
+
+    Returns
+    -------
+    dataset:
+        A dictionary of numpy arrays ready to be saved to disk.
+    """
+
+    # Global seeding (if the environment exposes a seed method)
+    if seed is not None and hasattr(env, "seed"):
+        env.seed(seed)
 
     observations: List[np.ndarray] = []
     actions: List[int] = []
     rewards: List[float] = []
-    costs: List[int] = []
+    costs: List[float] = []
     next_observations: List[np.ndarray] = []
-    dones: List[bool] = []
+    dones: List[float] = []
     episode_ids: List[int] = []
-    is_weights: List[float] = []
-    randomizations: List[Dict[str, float]] = []
-    outcomes: List[Dict[str, object]] = []
 
-    for ep in range(episodes):
-        obs = env.reset(seed=rng.integers(1_000_000_000))
+    cfg = env.config
+    ep_id = 0
+
+    # tqdm progress bar over episodes
+    for ep in trange(episodes, desc="Generating episodes"):
+        obs = env.reset()
         done = False
-        while not done:
-            action = int(policy(obs))
-            if action not in (ACTION_CONTINUE, ACTION_WAVE_OFF):
-                action = ACTION_CONTINUE
-            next_obs, reward, cost, done, _ = env.step(action)
+        wave_off_locked = False  # local latch mirroring env's wave-off mode
 
-            observations.append(obs.astype(np.float32, copy=False))
+        while not done:
+            # Current distance to stern
+            s = float(obs[2])
+            wave_off_allowed = cfg.wave_off_s_min <= s <= cfg.wave_off_s_max
+
+            # 1) Behaviour policy proposes an action
+            proposed_action = int(policy(obs))
+            if proposed_action not in (ACTION_CONTINUE, ACTION_WAVE_OFF):
+                proposed_action = ACTION_CONTINUE
+
+            # 2) Apply window + latching consistently with env semantics
+            if wave_off_locked:
+                # Once latched, the effective action is always WAVE_OFF
+                action = ACTION_WAVE_OFF
+            else:
+                if proposed_action == ACTION_WAVE_OFF and not wave_off_allowed:
+                    # Wave-off requested outside the allowed window -> ignore
+                    action = ACTION_CONTINUE
+                else:
+                    action = proposed_action
+
+                # First valid wave-off within the allowed window -> latch
+                if action == ACTION_WAVE_OFF and wave_off_allowed:
+                    wave_off_locked = True
+
+            # 3) Step environment with the effective action
+            next_obs, reward, cost, done, _info = env.step(action)
+
+            # 4) Log transition (effective action, consistent with env dynamics)
+            observations.append(obs.astype(np.float32))
             actions.append(action)
             rewards.append(float(reward))
-            costs.append(int(cost))
-            next_observations.append(next_obs.astype(np.float32, copy=False))
-            dones.append(bool(done))
-            episode_ids.append(ep)
-            is_weights.append(1.0)
+            costs.append(float(cost))
+            next_observations.append(next_obs.astype(np.float32))
+            dones.append(float(done))
+            episode_ids.append(ep_id)
 
             obs = next_obs
 
-        outcome = env.outcome
-        randomizations.append(env.current_randomization)
-        outcomes.append(
-            {
-                "episode": ep,
-                "mode": outcome.mode if outcome else "unknown",
-                "touchdown_error": outcome.touchdown_error if outcome else None,
-                "stern_clearance": outcome.stern_clearance if outcome else None,
-            }
-        )
+        ep_id += 1
 
-    dataset = {
-        "observations": np.asarray(observations, dtype=np.float32),
-        "actions": np.asarray(actions, dtype=np.int64),
-        "rewards": np.asarray(rewards, dtype=np.float32),
-        "costs": np.asarray(costs, dtype=np.int32),
-        "next_observations": np.asarray(next_observations, dtype=np.float32),
-        "dones": np.asarray(dones, dtype=np.bool_),
-        "episode_ids": np.asarray(episode_ids, dtype=np.int32),
-        "is_weights": np.asarray(is_weights, dtype=np.float32),
-    }
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output, **dataset)
-
-    meta = {
-        "episodes": episodes,
-        "randomizations": randomizations,
-        "outcomes": outcomes,
-        "policy": asdict(policy),
-        "seed": seed,
-    }
-    meta_path = output.with_suffix(".meta.json")
-    meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"Wrote dataset to {output}")
-    print(f"Metadata written to {meta_path}")
+    # Stack everything into contiguous arrays.
+    dataset = dict(
+        observations=np.stack(observations, axis=0),
+        actions=np.asarray(actions, dtype=np.int64),
+        rewards=np.asarray(rewards, dtype=np.float32),
+        costs=np.asarray(costs, dtype=np.float32),
+        next_observations=np.stack(next_observations, axis=0),
+        dones=np.asarray(dones, dtype=np.float32),
+        episode_ids=np.asarray(episode_ids, dtype=np.int64),
+    )
+    return dataset
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--episodes", type=int, default=2048, help="Number of episodes")
+def save_dataset(dataset: Dict[str, np.ndarray], path: Path) -> None:
+    """Save the dataset as a compressed .npz file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **dataset)
+    print(f"Saved dataset to {path} (size={path.stat().st_size / 1e6:.2f} MB)")
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Generate offline dataset for CQL.")
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=100000,
+        help="Number of episodes to simulate.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for environment and behaviour policy.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/dataset.npz"),
-        help="Output path for the dataset",
+        default=Path("data/waveoff_dataset.npz"),
+        help="Path to save the generated dataset (.npz).",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Base RNG seed")
-    return parser.parse_args()
+    args = parser.parse_args(list(argv) if argv is not None else None)
 
+    env = WaveOffEnv(seed=args.seed)
+    policy = BaselineThresholdPolicy()
 
-def main() -> None:
-    args = parse_args()
-    generate_dataset(args.episodes, args.output, args.seed)
+    dataset = generate_dataset(env, policy, args.episodes, seed=args.seed)
+    save_dataset(dataset, args.output)
 
 
 if __name__ == "__main__":
