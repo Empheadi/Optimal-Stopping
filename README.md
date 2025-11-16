@@ -16,6 +16,7 @@ evaluate the safe wave-off agent:
 | `waveoff.baseline` | Handcrafted threshold policy used for dataset generation and comparisons. |
 | `waveoff.gen_data` | Script to generate offline datasets with domain randomisation. |
 | `waveoff.cql` | Conservative Q-Learning (CQL) trainer with a safety penalty. |
+| `waveoff.optimal_stop` | Least-squares style optimal-stopping trainer with DP labels. |
 | `waveoff.ope` | Lightweight off-policy evaluation helpers producing confidence bounds. |
 | `waveoff.acceptance` | Command-line tool to summarise OPE statistics for acceptance testing. |
 
@@ -35,7 +36,13 @@ evaluate the safe wave-off agent:
    python -m waveoff.cql data/waveoff_dataset.npz runs/cql --epochs 100 --batch-size 512
    ```
 
-5. Inspect offline evaluation statistics:
+5. Or train the optimal-stopping classifier that directly reasons about wave-off vs continue decisions:
+
+   ```bash
+   python -m waveoff.optimal_stop --episodes 4096 --epochs 40 --eval-episodes 512
+   ```
+
+6. Inspect offline evaluation statistics:
 
    ```bash
     python -m waveoff.acceptance data/waveoff_dataset.npz --delta 1e-4
