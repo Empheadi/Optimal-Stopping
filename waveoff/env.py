@@ -15,6 +15,7 @@ The environment is designed for offline / batch RL:
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple
@@ -686,3 +687,56 @@ class WaveOffEnv:
     def current_randomization(self) -> Dict[str, float]:
         """Return the randomization parameters used for the current episode."""
         return dict(self._current_params)
+
+    # ------------------------------------------------------------------
+    # State snapshot utilities (used by optimal stopping solvers)
+    # ------------------------------------------------------------------
+
+    def get_internal_state(self) -> Dict[str, object]:
+        """Return a deep copy of the internal simulator state.
+
+        The returned dictionary captures everything required to resume the
+        simulation from the current time step, including the numpy RNG
+        state.  External solvers (e.g. optimal stopping trainers) can use
+        this to "branch" the simulator, evaluate counterfactual actions, and
+        then restore the original state without introducing bias.
+        """
+
+        if self._state is None:
+            raise RuntimeError("Environment must be reset before snapshotting state.")
+
+        return {
+            "state": self._state.copy(),
+            "time": float(self._time),
+            "waved_off": bool(self._waved_off),
+            "wave_off_vz": float(self._wave_off_vz),
+            "stern_checked": bool(self._stern_checked),
+            "stern_clearance": None if self._stern_clearance_value is None else float(self._stern_clearance_value),
+            "touched_down": bool(self._touched_down),
+            "outcome": copy.deepcopy(self._outcome),
+            "current_params": dict(self._current_params),
+            "phases": dict(self._phases),
+            "rng_state": copy.deepcopy(self.rng.bit_generator.state),
+        }
+
+    def set_internal_state(self, snapshot: Dict[str, object]) -> None:
+        """Restore the simulator to a previously captured snapshot."""
+
+        state = snapshot.get("state")
+        if state is None:
+            raise ValueError("Snapshot missing 'state'.")
+
+        self._state = np.array(state, dtype=np.float32)
+        self._time = float(snapshot.get("time", 0.0))
+        self._waved_off = bool(snapshot.get("waved_off", False))
+        self._wave_off_vz = float(snapshot.get("wave_off_vz", 0.0))
+        self._stern_checked = bool(snapshot.get("stern_checked", False))
+        self._stern_clearance_value = snapshot.get("stern_clearance")
+        self._touched_down = bool(snapshot.get("touched_down", False))
+        self._outcome = copy.deepcopy(snapshot.get("outcome"))
+        self._current_params = dict(snapshot.get("current_params", {}))
+        self._phases = dict(snapshot.get("phases", {}))
+
+        rng_state = snapshot.get("rng_state")
+        if rng_state is not None:
+            self.rng.bit_generator.state = copy.deepcopy(rng_state)
